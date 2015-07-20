@@ -1,0 +1,261 @@
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+static inline void memory_barrier()
+{
+    asm("mov r0, #0\n"
+        "mcr p15, #0, r0, c7, c10, #5\n"
+        "mov pc, lr\n");
+}
+
+static inline void data_cache_flush()
+{
+    asm("mov r0, #0\n"
+        "mcr p15, #0, r0, c7, c14, #0\n"
+        "mov pc, lr\n");
+}
+
+static inline void sync_barrier()
+{
+    asm("mov r0, #0\n"
+        "mcr p15, #0, r0, c7, c10, #4\n"
+        "mov pc, lr\n");
+}
+
+static inline void data_sync_barrier()
+{
+    asm("stmfd sp!, {r0-r8, r12, lr}\n"
+        "mcr p15, #0, ip, c7, c5, #0\n"
+        "mcr p15, #0, ip, c7, c5, #6\n"
+        "mcr p15, #0, ip, c7, c10, #4\n"
+        "mcr p15, #0, ip, c7, c10, #4\n"
+        "ldmfd sp!, {r0-r8, r12, pc}\n");
+}
+
+size_t strlen(const char *str)
+{
+    size_t ret = 0;
+    while (str[ret] != 0)
+        ret++;
+    return ret;
+}
+
+void *memset(void *ptr, int value, size_t num)
+{
+    for (size_t i = 0; i < num; i++)
+        ((uint8_t *)ptr)[i] = value;
+    return ptr;
+}
+
+enum
+{
+    // The GPIO registers base address
+    GPIO_BASE = 0x20200000,
+
+    // The offsets for each register
+    // Controls actuation of pull up/down to ALL GPIO pins
+    GPPUD = (GPIO_BASE + 0x94),
+
+    // Controls actuation of pull up/down for a specific GPIO pin
+    GPPUDCLK0 = (GPIO_BASE + 0x98),
+
+    // The base address for UART
+    UART0_BASE = 0x20201000,
+
+    // The offsets for each register for the UART
+    UART0_DR     = (UART0_BASE + 0x00),
+    UART0_RSRECR = (UART0_BASE + 0x04),
+    UART0_FR     = (UART0_BASE + 0x18),
+    UART0_ILPR   = (UART0_BASE + 0x20),
+    UART0_IBRD   = (UART0_BASE + 0x24),
+    UART0_FBRD   = (UART0_BASE + 0x28),
+    UART0_LCRH   = (UART0_BASE + 0x2C),
+    UART0_CR     = (UART0_BASE + 0x30),
+    UART0_IFLS   = (UART0_BASE + 0x34),
+    UART0_IMSC   = (UART0_BASE + 0x38),
+    UART0_RIS    = (UART0_BASE + 0x3C),
+    UART0_MIS    = (UART0_BASE + 0x40),
+    UART0_ICR    = (UART0_BASE + 0x44),
+    UART0_DMACR  = (UART0_BASE + 0x48),
+    UART0_ITCR   = (UART0_BASE + 0x80),
+    UART0_ITIP   = (UART0_BASE + 0x84),
+    UART0_ITOP   = (UART0_BASE + 0x88),
+    UART0_TDR    = (UART0_BASE + 0x8C),
+
+    // The base address for mailbox registers
+    MAIL_RECV   = 0x2000B880,
+    MAIL_PEEK   = 0x2000B890,
+    MAIL_SEND   = 0x2000B8A0,
+    MAIL_STATUS = 0x2000B898,
+
+    MAIL_FULL  = 0x80000000,
+    MAIL_EMPTY = 0x40000000
+};
+
+void uart_init()
+{
+    // Disable UART0
+    mmio_write(UART0_CR, 0x00000000);
+
+    // Setup the GPIO pin 14 and 15
+    // Disable pull up/down for all GPIO pins and delay for 150 cycles
+    mmio_write(GPPUD, 0x00000000);
+    delay(150);
+
+    // Disable pull up/down for pins 14 and 15 and delay for 150 cycles
+    mmio_write(GPPUDCLK0, (1 << 14) | (1 << 15));
+    delay(150);
+
+    // Write 0 to GPPUDCLK0 to make it take effect
+    mmio_write(GPPUDCLK0, 0x00000000);
+
+    // Clear pending interrupts
+    mmio_write(UART0_ICR, 0x07FF);
+
+    // Set integer and fractional part of the baud rate
+    // Divider = UART_CLOCK/(16*baud)
+    // Fraction part register = (fractional part*64) + 0.5
+    // UART_CLOCK = 3000000; baud = 115200
+
+    // Divider = 3000000/(16*115200) = 1.627 = ~1
+    // Fractional part register = (0.627*64) + 0.5 = 40.6 = ~40
+    mmio_write(UART0_IBRD, 1);
+    mmio_write(UART0_FBRD, 40);
+
+    // Enable FIFO and 8bit data transmission (1 stop bit, no parity)
+    mmio_write(UART0_LCRH, (1 << 4) | (1 << 5) | (1 << 6));
+
+    // Mask all interrupts
+    mmio_write(UART0_IMSC, 0b11111110010);
+
+    // Enable UART0, receive and transfer part of UART
+    mmio_write(UART0_CR, (1 << 0) | (1 << 8) | (1 << 9));
+}
+
+void uart_putc(unsigned char byte)
+{
+    // Wait for UART to become ready
+    while (mmio_read(UART0_FR) & (1 << 5));
+    mmio_write(UART0_DR, byte);
+}
+
+unsigned char uart_getc()
+{
+    // Wait for UART to have received something
+    while (mmio_read(UART0_FR) & (1 << 4));
+    return mmio_read(UART0_DR);
+}
+
+void uart_write(const unsigned char *buffer, size_t size)
+{
+    for (size_t i = 0; i < size; i++)
+        uart_putc(buffer[i]);
+}
+
+void uart_puts(const char *str)
+{
+    uart_write((const unsigned char *)str, strlen(str));
+}
+
+int mailbox_get_send_status()
+{
+    return mmio_read(MAIL_STATUS) & (1 << 31);
+}
+
+uint32_t mailbox_status()
+{
+    volatile uint32_t v;
+    memory_barrier();
+    data_cache_flush();
+    v = *((uint32_t *)(0x20000000 + 0xB880 + 0x00 + 0x18));
+    memory_barrier();
+    return v;
+}
+
+void mailbox_write(uint32_t v, uint32_t id)
+{
+    memory_barrier();
+    data_cache_flush();
+
+    while (true)
+    {
+        uint32_t s = mailbox_status();
+        if ((s & 0x80000000) == 0)
+            break;
+    }
+
+    mmio_write(MAIL_SEND, (v << 4) | id);
+    memory_barrier();
+}
+
+uint32_t mailbox_read(uint32_t id)
+{
+    memory_barrier();
+    data_cache_flush();
+
+    volatile uint32_t v;
+    while (true)
+    {
+        while ((mailbox_status() & 0x40000000) != 0);
+
+        v = *((uint32_t *)(0x20000000 + 0xB880 + 0x00 + 0x00));
+        if ((v & 0x0F) == id)
+            break;
+    }
+
+    memory_barrier();
+    return (v >> 4) & 0x0FFFFFFF;
+}
+
+struct framebuffer_info
+{
+    uint32_t width;
+    uint32_t height;
+    uint32_t virtual_width;
+    uint32_t virtual_height;
+    uint32_t pitch;
+    uint32_t depth;
+    uint32_t x;
+    uint32_t y;
+    uint8_t *pointer;
+    uint32_t size;
+};
+
+void framebuffer_init(int width, int height, int depth)
+{
+    if (width > 4096) return;
+    if (height > 4096) return;
+    if (depth > 32) return;
+
+    struct framebuffer_info info;
+    info.width = info.virtual_width = width;
+    info.height = info.virtual_height = height;
+    info.pitch = 0;
+    info.depth = 16;
+    info.x = 0;
+    info.y = 0;
+    info.pointer = 0;
+    info.size = 0;
+
+    mailbox_write((uint32_t)&info + 0x40000000, 1);
+    if (mailbox_read(1) != 0)
+        // Something fucked up
+        while (true);
+
+    // Clear the framebuffer
+    memset(info.pointer, 0, info.size);
+}
+
+void kernel_main(uint32_t r0, uint32_t r1, uint32_t atags)
+{
+    (void)r0;
+    (void)r1;
+    (void)atags;
+
+
+
+    framebuffer_init(800, 600, 16);
+
+
+}
